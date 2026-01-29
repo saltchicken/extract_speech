@@ -40,19 +40,19 @@ import soundfile as sf
 import numpy as np
 from pathlib import Path
 
-def extract_audio_from_video(video_path, temp_audio_path="temp_raw.wav"):
+def extract_audio_from_video(video_path, temp_audio_path="temp_raw.wav", target_sr=48000): # ‼️ CHANGED: Added target_sr param
     """
     Step 1: Extract audio from video file using MoviePy.
     """
-    print(f"--> Extracting audio from {video_path}...")
+    print(f"--> Extracting audio from {video_path} at {target_sr}Hz...")
     try:
         video = VideoFileClip(video_path)
-        # ‼️ CHANGED: Write to 48kHz (optimal for DeepFilterNet) instead of 16kHz
+        # ‼️ CHANGED: Write to target_sr (48k for DFN, 16k for VAD-only)
         # ‼️ CHANGED: Added ffmpeg_params=['-ac', '1'] to force MONO extraction
         video.audio.write_audiofile(
             temp_audio_path, 
             codec='pcm_s16le', 
-            fps=48000, 
+            fps=target_sr, # ‼️ CHANGED: Use target_sr variable
             ffmpeg_params=["-ac", "1"],
             logger=None
         )
@@ -171,7 +171,7 @@ def reduce_background_noise(audio_path, output_path="temp_clean.wav", chunk_sec=
     
     return output_path, target_sr
 
-def split_audio_vad(audio_path, output_dir, sampling_rate=16000, threshold=0.35, min_silence_ms=500, speech_pad_ms=400, min_duration_sec=3.0): # ‼️ CHANGED defaults (pad 50->400, dur 0.5->3.0)
+def split_audio_vad(audio_path, output_dir, sampling_rate=16000, threshold=0.35, min_silence_ms=500, speech_pad_ms=400, min_duration_sec=3.0, merge_threshold_ms=0): # ‼️ ADDED merge param
     """
     Step 3: Use Silero VAD (Torch) to detect speech timestamps and split.
     """
@@ -225,6 +225,31 @@ def split_audio_vad(audio_path, output_dir, sampling_rate=16000, threshold=0.35,
         print("No speech detected even after retry.")
         return
 
+    # ‼️ NEW LOGIC: Intelligent Merging
+    # If segments are close together (e.g., pauses within a sentence), merge them.
+    if merge_threshold_ms > 0 and len(speech_timestamps) > 1:
+        print(f"--> Intelligent Merging (joining gaps < {merge_threshold_ms}ms)...")
+        merged = []
+        current = speech_timestamps[0]
+        
+        for next_seg in speech_timestamps[1:]:
+            # Calculate gap between end of current and start of next
+            silence_gap_samples = next_seg['start'] - current['end']
+            silence_gap_ms = (silence_gap_samples / sampling_rate) * 1000
+            
+            # Check if gap is smaller than threshold (or negative if overlapping due to padding)
+            if silence_gap_ms <= merge_threshold_ms:
+                # Merge: Extend current segment's end to the next segment's end
+                current['end'] = max(current['end'], next_seg['end'])
+            else:
+                # Gap is too big (likely a new sentence), save current and start new
+                merged.append(current)
+                current = next_seg
+        
+        merged.append(current)
+        print(f"    Merged {len(speech_timestamps)} raw segments into {len(merged)} sentence-like chunks.")
+        speech_timestamps = merged
+
     # Create output directory
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
@@ -266,6 +291,8 @@ def main():
     parser.add_argument("--speech_pad", type=int, default=400, help="Padding in ms added to start/end of speech") # ‼️ CHANGED default from 50 to 400
     parser.add_argument("--min_duration", type=float, default=3.0, help="Minimum chunk duration in seconds to keep") # ‼️ CHANGED default from 0.5 to 3.0
     parser.add_argument("--chunk_size", type=int, default=60, help="Processing chunk size in seconds for memory efficiency") # ‼️ ADDED
+    parser.add_argument("--merge_threshold", type=int, default=1500, help="Merge segments if silence gap is less than this (ms). Helps keep sentences together.") # ‼️ ADDED
+    parser.add_argument("--skip_denoise", action="store_true", help="Skip DeepFilterNet denoising (useful if audio is already clean)") # ‼️ ADDED
 
     args = parser.parse_args()
 
@@ -279,24 +306,42 @@ def main():
         print(f"Video file not found: {VIDEO_FILE}")
         return
 
+    # Determine extraction rate based on whether we are denoising
+    # DeepFilterNet works best with 48k input -> 16k output
+    # Silero VAD requires 16k
+    if args.skip_denoise: # ‼️ ADDED: Logic to handle skip
+        print("--> Skipping DeepFilterNet (Denoising disabled). Extracting at 16kHz for VAD.")
+        extraction_sr = 16000
+    else:
+        print("--> Denoising enabled. Extracting at 48kHz for DeepFilterNet.")
+        extraction_sr = 48000
+
     # 1. Extract
-    # ‼️ Extraction now targets 48kHz for DFN compatibility
-    raw_audio = extract_audio_from_video(VIDEO_FILE, TEMP_RAW)
+    # ‼️ Extraction target_sr depends on whether we denoise
+    raw_audio = extract_audio_from_video(VIDEO_FILE, TEMP_RAW, target_sr=extraction_sr)
     
     if raw_audio:
-        # 2. Denoise
-        # ‼️ Calls new DeepFilterNet logic (auto-resamples to 16k at end)
-        clean_audio, rate = reduce_background_noise(raw_audio, TEMP_CLEAN, chunk_sec=args.chunk_size)
+        # Default flow vars
+        processing_audio = raw_audio
+        processing_sr = extraction_sr
+
+        # 2. Denoise (Optional)
+        if not args.skip_denoise: # ‼️ ADDED: Check flag
+            # ‼️ Calls new DeepFilterNet logic (auto-resamples to 16k at end)
+            clean_audio, rate = reduce_background_noise(raw_audio, TEMP_CLEAN, chunk_sec=args.chunk_size)
+            processing_audio = clean_audio
+            processing_sr = rate
         
         # 3. Split by Speech
         split_audio_vad(
-            clean_audio, 
+            processing_audio, 
             OUTPUT_FOLDER, 
-            sampling_rate=rate,
+            sampling_rate=processing_sr,
             threshold=args.vad_threshold,
             min_silence_ms=args.min_silence,
             speech_pad_ms=args.speech_pad,
-            min_duration_sec=args.min_duration
+            min_duration_sec=args.min_duration,
+            merge_threshold_ms=args.merge_threshold # ‼️ ADDED parameter pass
         )
         
         # Cleanup temp files
