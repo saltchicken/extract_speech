@@ -93,11 +93,6 @@ def reduce_background_noise(audio_path, output_path="temp_clean.wav", chunk_sec=
     # We process it
     # We write (chunk) to output (discarding overlap from the start)
     
-    # NOTE: The logic is:
-    # Read [current_pos - overlap : current_pos + chunk]
-    # Enhance
-    # Save [overlap_samples_in_output : ] (Skip the warmed-up part)
-    
     chunk_samples = int(chunk_sec * original_sr)
     overlap_samples = int(overlap_sec * original_sr)
     
@@ -107,7 +102,6 @@ def reduce_background_noise(audio_path, output_path="temp_clean.wav", chunk_sec=
         
         # Iterate
         current_pos = 0
-        total_processed = 0
         
         while current_pos < total_samples:
             # Determine start reading position (include overlap back)
@@ -172,9 +166,12 @@ def reduce_background_noise(audio_path, output_path="temp_clean.wav", chunk_sec=
             torch.cuda.empty_cache()
 
     print("\n    Denoising complete.")
+    
+    # ‼️ FIX: Removed the incorrect sf.write() that was here overwriting the file
+    
     return output_path, target_sr
 
-def split_audio_vad(audio_path, output_dir, sampling_rate=16000, threshold=0.35, min_silence_ms=500, speech_pad_ms=50, min_duration_sec=0.5):
+def split_audio_vad(audio_path, output_dir, sampling_rate=16000, threshold=0.35, min_silence_ms=500, speech_pad_ms=400, min_duration_sec=3.0): # ‼️ CHANGED defaults (pad 50->400, dur 0.5->3.0)
     """
     Step 3: Use Silero VAD (Torch) to detect speech timestamps and split.
     """
@@ -192,6 +189,12 @@ def split_audio_vad(audio_path, output_dir, sampling_rate=16000, threshold=0.35,
     data, sr = sf.read(audio_path)
     wav = torch.from_numpy(data).float()
     
+    # ‼️ DIAGNOSTIC: Check if audio is silent
+    max_amp = wav.abs().max().item()
+    print(f"    Audio Max Amplitude: {max_amp:.6f}")
+    if max_amp < 0.001:
+        print("    ⚠️ WARNING: Audio appears silent. DeepFilterNet might have failed or input was silent.")
+    
     # Silero expects shape (1, T)
     if wav.ndim == 1:
         wav = wav.unsqueeze(0)
@@ -206,8 +209,20 @@ def split_audio_vad(audio_path, output_dir, sampling_rate=16000, threshold=0.35,
         speech_pad_ms=speech_pad_ms
     )
     
+    # ‼️ FALLBACK: If strict threshold fails, try lenient
     if not speech_timestamps:
-        print("No speech detected.")
+        print(f"    No speech found with threshold {threshold}. Retrying with threshold 0.1...")
+        speech_timestamps = get_speech_timestamps(
+            wav, 
+            model, 
+            sampling_rate=sampling_rate, 
+            threshold=0.1, 
+            min_silence_duration_ms=min_silence_ms,
+            speech_pad_ms=speech_pad_ms
+        )
+
+    if not speech_timestamps:
+        print("No speech detected even after retry.")
         return
 
     # Create output directory
@@ -248,8 +263,8 @@ def main():
     # parser.add_argument("--noise_prop", type=float, default=0.65, help="Noise reduction proportion") ‼️ REMOVED
     parser.add_argument("--vad_threshold", type=float, default=0.35, help="Speech detection sensitivity (0.0-1.0, lower is more sensitive)")
     parser.add_argument("--min_silence", type=int, default=500, help="Minimum silence duration in ms to split segments")
-    parser.add_argument("--speech_pad", type=int, default=50, help="Padding in ms added to start/end of speech")
-    parser.add_argument("--min_duration", type=float, default=0.5, help="Minimum chunk duration in seconds to keep")
+    parser.add_argument("--speech_pad", type=int, default=400, help="Padding in ms added to start/end of speech") # ‼️ CHANGED default from 50 to 400
+    parser.add_argument("--min_duration", type=float, default=3.0, help="Minimum chunk duration in seconds to keep") # ‼️ CHANGED default from 0.5 to 3.0
     parser.add_argument("--chunk_size", type=int, default=60, help="Processing chunk size in seconds for memory efficiency") # ‼️ ADDED
 
     args = parser.parse_args()
